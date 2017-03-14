@@ -11,7 +11,7 @@
 #include <stdio.h>
 #include <string.h>
 
-static void usb_control_complete(iotxn_t* txn, void* cookie) {
+static void usb_complete(iotxn_t* txn, void* cookie) {
     completion_signal((completion_t*)cookie);
 }
 
@@ -22,6 +22,7 @@ mx_status_t usb_control(mx_device_t* device, uint8_t request_type, uint8_t reque
     mx_status_t status = iotxn_alloc(&txn, 0, length, 0);
     if (status != NO_ERROR) return status;
     txn->protocol = MX_PROTOCOL_USB;
+    txn->opcode = USB_OPCODE_TXN;
 
     static_assert(sizeof(usb_protocol_data_t) <= sizeof(iotxn_proto_data_t), "");
     usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
@@ -44,7 +45,7 @@ mx_status_t usb_control(mx_device_t* device, uint8_t request_type, uint8_t reque
     completion_t completion = COMPLETION_INIT;
 
     txn->length = length;
-    txn->complete_cb = usb_control_complete;
+    txn->complete_cb = usb_complete;
     txn->cookie = &completion;
     iotxn_queue(device, txn);
     completion_wait(&completion, MX_TIME_INFINITE);
@@ -143,6 +144,28 @@ mx_status_t usb_clear_feature(mx_device_t* device, uint8_t request_type, int fea
     return usb_control(device, request_type, USB_REQ_CLEAR_FEATURE, feature, index, NULL, 0);
 }
 
+mx_status_t usb_reset_endpoint(mx_device_t* device, uint8_t ep_address) {
+    iotxn_t* txn;
+
+    mx_status_t status = iotxn_alloc(&txn, 0, 0, 0);
+    if (status != NO_ERROR) return status;
+    txn->protocol = MX_PROTOCOL_USB;
+    txn->opcode = USB_OPCODE_RESET_EP;
+    usb_protocol_data_t* proto_data = iotxn_pdata(txn, usb_protocol_data_t);
+    memset(proto_data, 0, sizeof(*proto_data));
+    proto_data->ep_address = ep_address;
+
+    completion_t completion = COMPLETION_INIT;
+    txn->complete_cb = usb_complete;
+    txn->cookie = &completion;
+    iotxn_queue(device, txn);
+    completion_wait(&completion, MX_TIME_INFINITE);
+
+    status = txn->status;
+    txn->ops->release(txn);
+    return status;
+}
+
 // helper function for allocating iotxns for USB transfers
 iotxn_t* usb_alloc_iotxn(uint8_t ep_address, size_t data_size, size_t extra_size) {
     iotxn_t* txn;
@@ -152,6 +175,7 @@ iotxn_t* usb_alloc_iotxn(uint8_t ep_address, size_t data_size, size_t extra_size
         return NULL;
     }
     txn->protocol = MX_PROTOCOL_USB;
+    txn->opcode = USB_OPCODE_TXN;
 
     usb_protocol_data_t* data = iotxn_pdata(txn, usb_protocol_data_t);
     memset(data, 0, sizeof(*data));

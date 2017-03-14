@@ -11,6 +11,10 @@
 
 __BEGIN_CDECLS;
 
+// opcodes for iotxn_t.opcode
+#define USB_OPCODE_TXN       0   // for transactions on USB endpoints
+#define USB_OPCODE_RESET_EP  1   // resets a halted endpoint
+
 // protocol data for iotxns
 typedef struct usb_protocol_data {
     usb_setup_t setup;      // for control transactions

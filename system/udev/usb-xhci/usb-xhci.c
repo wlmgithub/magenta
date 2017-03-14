@@ -211,7 +211,7 @@ static void xhci_iotxn_callback(mx_status_t result, void* cookie) {
     txn->ops->complete(txn, status, actual);
 }
 
-static mx_status_t xhci_do_iotxn_queue(xhci_t* xhci, iotxn_t* txn) {
+static mx_status_t xhci_do_iotxn_queue_txn(xhci_t* xhci, iotxn_t* txn) {
     usb_protocol_data_t* data = iotxn_pdata(txn, usb_protocol_data_t);
     int rh_index = xhci_get_root_hub_index(xhci, data->device_id);
     if (rh_index >= 0) {
@@ -261,6 +261,33 @@ static mx_status_t xhci_do_iotxn_queue(xhci_t* xhci, iotxn_t* txn) {
         list_add_tail(&ring->deferred_txns, &txn->node);
     }
     return status;
+}
+
+static mx_status_t xhci_do_reset_endpoint(xhci_t* xhci, iotxn_t* txn) {
+    usb_protocol_data_t* data = iotxn_pdata(txn, usb_protocol_data_t);
+    int rh_index = xhci_get_root_hub_index(xhci, data->device_id);
+    if (rh_index >= 0) {
+        return ERR_INVALID_ARGS;
+    }
+    if (data->device_id > xhci->max_slots) {
+        return ERR_INVALID_ARGS;
+    }
+    uint8_t ep_index = xhci_endpoint_index(data->ep_address);
+    mx_status_t status = xhci_reset_endpoint(xhci, data->device_id, ep_index);
+    txn->ops->complete(txn, status, 0);
+    return status;
+}
+
+static mx_status_t xhci_do_iotxn_queue(xhci_t* xhci, iotxn_t* txn) {
+    switch (txn->opcode) {
+    case USB_OPCODE_TXN:
+        return xhci_do_iotxn_queue_txn(xhci, txn);
+    case USB_OPCODE_RESET_EP:
+        return xhci_do_reset_endpoint(xhci, txn);
+    default:
+        printf("bad opcode %d in xhci_do_iotxn_queue\n", txn->opcode);
+        return ERR_INVALID_ARGS;
+    }
 }
 
 void xhci_process_deferred_txns(xhci_t* xhci, xhci_transfer_ring_t* ring, bool closed) {
