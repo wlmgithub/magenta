@@ -507,7 +507,20 @@ static void do_dwc_iotxn_queue(dwc_usb_t* dwc, iotxn_t* txn) {
 
 static void dwc_iotxn_queue(mx_device_t* hci_device, iotxn_t* txn) {
     dwc_usb_t* dwc = dev_to_usb_dwc(hci_device);
-    do_dwc_iotxn_queue(dwc, txn);
+
+    switch (txn->opcode) {
+    case USB_OPCODE_TXN:
+        do_dwc_iotxn_queue(dwc, txn);
+        break;
+    case USB_OPCODE_RESET_EP:
+        printf("dwc_iotxn_queue USB_OPCODE_RESET_EP not implemented\n");
+        txn->ops->complete(txn, ERR_NOT_SUPPORTED, 0);
+        break;
+    default:
+        printf("bad opcode %d in dev_to_usb_dwc\n", txn->opcode);
+        txn->ops->complete(txn, ERR_INVALID_ARGS, 0);
+        break;
+    }
 }
 
 static void dwc_unbind(mx_device_t* dev) {
