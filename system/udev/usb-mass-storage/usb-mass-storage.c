@@ -310,7 +310,7 @@ static void clone_complete(iotxn_t* clone, void* cookie) {
 
 static void ums_queue_data_transfer(ums_t* msd, iotxn_t* txn, uint8_t ep_address) {
     iotxn_t* clone;
-    mx_status_t status = txn->ops->clone(txn, &clone, 0);
+    mx_status_t status = txn->ops->clone(txn, &clone);
     if (status != NO_ERROR) {
         txn->ops->complete(txn, status, 0);
         return;
