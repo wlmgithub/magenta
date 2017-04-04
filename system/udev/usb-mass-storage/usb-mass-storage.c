@@ -51,6 +51,7 @@ typedef struct {
     uint8_t lun;
     uint64_t total_blocks;
     uint32_t block_size;
+    size_t max_transfer;  // maximum transfer size reported by usb_get_max_transfer_size()
 
     bool use_read_write_16; // use READ16 and WRITE16 if total_blocks > 0xFFFFFFFF
 
@@ -711,6 +712,10 @@ static mx_status_t ums_bind(mx_driver_t* driver, mx_device_t* device, void** coo
     msd->driver = driver;
     msd->bulk_in_addr = bulk_in_addr;
     msd->bulk_out_addr = bulk_out_addr;
+
+    size_t max_in = usb_get_max_transfer_size(device, bulk_in_addr);
+    size_t max_out = usb_get_max_transfer_size(device, bulk_out_addr);
+    msd->max_transfer = (max_in < max_out ? max_in : max_out);
 
     mx_status_t status = NO_ERROR;
     msd->cbw_iotxn = usb_alloc_iotxn(bulk_out_addr, sizeof(ums_cbw_t), 0);
