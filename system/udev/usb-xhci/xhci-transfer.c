@@ -424,7 +424,7 @@ int xhci_control_request(xhci_t* xhci, uint32_t slot_id, uint8_t request_type, u
 
     iotxn_t* txn;
 
-    mx_status_t status = iotxn_alloc(&txn, IOTXN_ALLOC_CONTIGUOUS | IOTXN_ALLOC_POOL, length);
+    mx_status_t status = iotxn_alloc(&txn, IOTXN_ALLOC_POOL, length);
     if (status != NO_ERROR) return status;
     txn->protocol = MX_PROTOCOL_USB;
 
