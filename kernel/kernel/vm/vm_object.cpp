@@ -17,6 +17,7 @@
 #include <lib/console.h>
 #include <mxtl/ref_ptr.h>
 #include <new.h>
+#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
@@ -62,6 +63,20 @@ void VmObject::AddChildLocked(VmObject* o) TA_REQ(lock_) {
 void VmObject::RemoveChildLocked(VmObject* o) TA_REQ(lock_) {
     canary_.Assert();
     children_list_.erase(*o);
+}
+
+void VmObject::RangeChangeUpdateLocked(uint64_t offset, uint64_t len) {
+    canary_.Assert();
+
+    // other mappings may have covered this offset into the vmo, so unmap those ranges
+    for (auto& m : mapping_list_) {
+        m.UnmapVmoRangeLocked(offset, len);
+    }
+
+    // inform all our children this as well, so they can inform their mappings
+    for (auto& child : children_list_) {
+        child.RangeChangeUpdateFromParentLocked(offset, len);
+    }
 }
 
 static int cmd_vm_object(int argc, const cmd_args* argv, uint32_t flags) {

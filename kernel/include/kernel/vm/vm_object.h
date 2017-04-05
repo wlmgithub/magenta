@@ -114,21 +114,6 @@ public:
         return ERR_NOT_SUPPORTED;
     }
 
-protected:
-    // private constructor (use Create())
-    explicit VmObject(mxtl::RefPtr<VmObject> parent);
-    VmObject() : VmObject(nullptr) { }
-
-    // private destructor, only called from refptr
-    virtual ~VmObject();
-    friend mxtl::RefPtr<VmObject>;
-
-    DISALLOW_COPY_ASSIGN_AND_MOVE(VmObject);
-
-    // private apis used by the VmMapping class
-    // get a pointer to a page at a given offset
-    friend class VmMapping;
-
     // get the physical address of a page at offset
     virtual status_t GetPageLocked(uint64_t offset, uint pf_flags, vm_page_t** page, paddr_t* pa) TA_REQ(lock_) {
         return ERR_NOT_SUPPORTED;
@@ -142,6 +127,25 @@ protected:
 
     void AddChildLocked(VmObject* r) TA_REQ(lock_);
     void RemoveChildLocked(VmObject* r) TA_REQ(lock_);
+
+protected:
+    // private constructor (use Create())
+    explicit VmObject(mxtl::RefPtr<VmObject> parent);
+    VmObject() : VmObject(nullptr) { }
+
+    // private destructor, only called from refptr
+    virtual ~VmObject();
+    friend mxtl::RefPtr<VmObject>;
+
+    DISALLOW_COPY_ASSIGN_AND_MOVE(VmObject);
+
+    // inform all mappings and children that a range changed
+    void RangeChangeUpdateLocked(uint64_t offset, uint64_t len) TA_REQ(lock_);
+
+    // above call but called from a parent
+    virtual void RangeChangeUpdateFromParentLocked(uint64_t offset, uint64_t len) TA_REQ(lock_) {
+        RangeChangeUpdateLocked(offset, len);
+    }
 
     // magic value
     mxtl::Canary<mxtl::magic("VMO_")> canary_;
@@ -160,7 +164,7 @@ protected:
     mxtl::DoublyLinkedList<VmObject*> children_list_ TA_GUARDED(lock_);
 
     // parent pointer (may be null)
-    mxtl::RefPtr<VmObject> parent_;
+    mxtl::RefPtr<VmObject> parent_ TA_GUARDED(lock_);
 };
 
 // the main VM object type, holding a list of pages
@@ -205,6 +209,8 @@ public:
 
     status_t ClonePrivate(uint64_t offset, uint64_t size,
                           mxtl::RefPtr<VmObject>* clone_vmo) override;
+
+    void RangeChangeUpdateFromParentLocked(uint64_t offset, uint64_t len) override TA_REQ(lock_);
 
 private:
     // private constructor (use Create())
@@ -268,6 +274,7 @@ private:
 
     // private destructor, only called from refptr
     ~VmObjectPhysical() override;
+    friend mxtl::RefPtr<VmObjectPhysical>;
 
     DISALLOW_COPY_ASSIGN_AND_MOVE(VmObjectPhysical);
 

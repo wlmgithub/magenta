@@ -88,6 +88,9 @@ status_t VmObjectPaged::ClonePrivate(uint64_t offset, uint64_t size, mxtl::RefPt
     if (!ac.check())
         return ERR_NO_MEMORY;
 
+    // add it as a child to us
+    AddChildLocked(vmo.get());
+
     // set the new clone's size
     auto status = vmo->ResizeLocked(size);
     if (status != NO_ERROR)
@@ -98,9 +101,6 @@ status_t VmObjectPaged::ClonePrivate(uint64_t offset, uint64_t size, mxtl::RefPt
     status = vmo->SetParentOffsetLocked(offset);
     if (status != NO_ERROR)
         return status;
-
-    // we're ready to go now, add it as a child to us and exit
-    AddChildLocked(vmo.get());
 
     *clone_vmo = mxtl::move(vmo);
 
@@ -227,13 +227,27 @@ status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, vm_page_t*
         return NO_ERROR;
     }
 
-    // if we're not being asked to sw or hw fault in the page, return not found
-    if ((pf_flags & VMM_PF_FLAG_FAULT_MASK) == 0)
-        return ERR_NOT_FOUND;
-
     __UNUSED char pf_string[5];
     LTRACEF("vmo %p, offset %#" PRIx64 ", pf_flags %#x (%s)\n", this, offset, pf_flags,
            vmm_pf_flags_to_string(pf_flags, pf_string));
+
+    // if we have a parent vmo and we're read-only faulting, see if they have a page for us
+    if (parent_ && !(pf_flags & VMM_PF_FLAG_WRITE)) {
+        safeint::CheckedNumeric<uint64_t> parent_offset = parent_offset_;
+        parent_offset += offset;
+        DEBUG_ASSERT(parent_offset.IsValid());
+
+        // make sure we dont cause the parent to fault in new pages, just ask for any that already exist
+        uint parent_pf_flags = pf_flags & ~(VMM_PF_FLAG_FAULT_MASK);
+
+        status_t status = parent_->GetPageLocked(parent_offset.ValueOrDie(), parent_pf_flags, page_out, pa_out);
+        if (status == NO_ERROR)
+            return NO_ERROR;
+    }
+
+    // if we're not being asked to sw or hw fault in the page, return not found
+    if ((pf_flags & VMM_PF_FLAG_FAULT_MASK) == 0)
+        return ERR_NOT_FOUND;
 
     // based on the type of fault, return either a new page or the zero page
     if ((pf_flags & VMM_PF_FLAG_WRITE) == 0) {
@@ -262,9 +276,7 @@ status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, vm_page_t*
     LTRACEF("faulted in page %p, pa %#" PRIxPTR "\n", p, pa);
 
     // other mappings may have covered this offset into the vmo, so unmap those ranges
-    for (auto& m : mapping_list_) {
-        m.UnmapVmoRangeLocked(offset, PAGE_SIZE);
-    }
+    RangeChangeUpdateLocked(offset, PAGE_SIZE);
 
     if (page_out)
         *page_out = p;
@@ -317,10 +329,7 @@ status_t VmObjectPaged::CommitRange(uint64_t offset, uint64_t len, uint64_t* com
     }
 
     // unmap all of the pages in this range on all the mapping regions
-    for (auto& m : mapping_list_) {
-        // unmap any pages the region may have mapped that intersect this range
-        m.UnmapVmoRangeLocked(offset, end - offset);
-    }
+    RangeChangeUpdateLocked(offset, end - offset);
 
     // add them to the appropriate range of the object
     for (uint64_t o = offset; o < end; o += PAGE_SIZE) {
@@ -397,10 +406,7 @@ status_t VmObjectPaged::CommitRangeContiguous(uint64_t offset, uint64_t len, uin
     DEBUG_ASSERT(list_length(&page_list) == allocated);
 
     // unmap all of the pages in this range on all the mapping regions
-    for (auto& m : mapping_list_) {
-        // unmap any pages the region may have mapped that intersect this range
-        m.UnmapVmoRangeLocked(offset, end - offset);
-    }
+    RangeChangeUpdateLocked(offset, end - offset);
 
     // add them to the appropriate range of the object
     for (uint64_t o = offset; o < end; o += PAGE_SIZE) {
@@ -454,10 +460,7 @@ status_t VmObjectPaged::DecommitRange(uint64_t offset, uint64_t len, uint64_t* d
             page_aligned_len);
 
     // unmap all of the pages in this range on all the mapping regions
-    for (auto& m : mapping_list_) {
-        // unmap any pages the region may have mapped that intersect this range
-        m.UnmapVmoRangeLocked(start, page_aligned_len);
-    }
+    RangeChangeUpdateLocked(start, page_aligned_len);
 
     // iterate through the pages, freeing them
     while (start < end) {
@@ -479,8 +482,9 @@ status_t VmObjectPaged::ResizeLocked(uint64_t s) {
     if (s > MAX_SIZE)
         return ERR_OUT_OF_RANGE;
 
-    // see if we're shrinking the vmo
+    // see if we're shrinking or expanding the vmo
     if (s < size_) {
+        // shrinking
         // figure the starting and ending page offset that is affected
         uint64_t start = ROUNDUP_PAGE_SIZE(s);
         uint64_t end = ROUNDUP_PAGE_SIZE(size_);
@@ -489,16 +493,25 @@ status_t VmObjectPaged::ResizeLocked(uint64_t s) {
         // we're only worried about whole pages to be removed
         if (page_aligned_len > 0) {
             // unmap all of the pages in this range on all the mapping regions
-            for (auto& m : mapping_list_) {
-                // unmap any pages the region may have mapped that intersect this range
-                m.UnmapVmoRangeLocked(start, page_aligned_len);
-            }
+            RangeChangeUpdateLocked(start, page_aligned_len);
 
             // iterate through the pages, freeing them
             while (start < end) {
                 page_list_.FreePage(start);
                 start += PAGE_SIZE;
             }
+        }
+    } else if (s > size_) {
+        // expanding
+        // figure the starting and ending page offset that is affected
+        uint64_t start = ROUNDUP_PAGE_SIZE(size_);
+        uint64_t end = ROUNDUP_PAGE_SIZE(s);
+        uint64_t page_aligned_len = end - start;
+
+        // we're only worried about whole pages to be added
+        if (page_aligned_len > 0) {
+            // inform all our children or mapping that there's new bits
+            RangeChangeUpdateLocked(start, page_aligned_len);
         }
     }
 
@@ -775,3 +788,34 @@ status_t VmObjectPaged::CacheOp(const uint64_t start_offset, const uint64_t len,
 
     return NO_ERROR;
 }
+
+void VmObjectPaged::RangeChangeUpdateFromParentLocked(const uint64_t offset, const uint64_t len) {
+    canary_.Assert();
+
+    LTRACEF("offset %#" PRIx64 " len %#" PRIx64 " p_offset %#" PRIx64 " size_ %#" PRIx64 "\n",
+            offset, len, parent_offset_, size_);
+
+    // our parent is notifying that a range of theirs changed, see where it intersects
+    // with our offset into the parent and pass it on
+    uint64_t offset_new;
+    uint64_t len_new;
+    if (!GetIntersect(parent_offset_, size_, offset, len,
+                      &offset_new, &len_new))
+        return;
+
+    // if they intersect with us, then by definition the new offset must be >= parent_offset_
+    DEBUG_ASSERT(offset_new >= parent_offset_);
+
+    // subtract our offset
+    offset_new -= parent_offset_;
+
+    // verify that it's still within range of us
+    DEBUG_ASSERT(offset_new + len_new <= size_);
+
+    LTRACEF("new offset %#" PRIx64 " new len %#" PRIx64 "\n",
+            offset_new, len_new);
+
+    // pass it on
+    RangeChangeUpdateLocked(offset_new, len_new);
+}
+
