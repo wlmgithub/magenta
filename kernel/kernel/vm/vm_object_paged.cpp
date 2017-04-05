@@ -18,6 +18,7 @@
 #include <lib/console.h>
 #include <lib/user_copy.h>
 #include <new.h>
+#include <safeint/safe_math.h>
 #include <stdlib.h>
 #include <string.h>
 #include <trace.h>
@@ -40,13 +41,14 @@ void ZeroPage(vm_page_t* p) {
 
 } // namespace
 
-VmObjectPaged::VmObjectPaged(uint32_t pmm_alloc_flags)
-    : pmm_alloc_flags_(pmm_alloc_flags) {
+VmObjectPaged::VmObjectPaged(uint32_t pmm_alloc_flags, mxtl::RefPtr<VmObject> parent)
+    : VmObject(parent), pmm_alloc_flags_(pmm_alloc_flags) {
     LTRACEF("%p\n", this);
 }
 
 VmObjectPaged::~VmObjectPaged() {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
+
     LTRACEF("%p\n", this);
 
     // free all of the pages attached to us
@@ -59,7 +61,7 @@ mxtl::RefPtr<VmObject> VmObjectPaged::Create(uint32_t pmm_alloc_flags, uint64_t 
         return nullptr;
 
     AllocChecker ac;
-    auto vmo = mxtl::AdoptRef<VmObject>(new (&ac) VmObjectPaged(pmm_alloc_flags));
+    auto vmo = mxtl::AdoptRef<VmObject>(new (&ac) VmObjectPaged(pmm_alloc_flags, nullptr));
     if (!ac.check())
         return nullptr;
 
@@ -74,11 +76,39 @@ mxtl::RefPtr<VmObject> VmObjectPaged::Create(uint32_t pmm_alloc_flags, uint64_t 
     return vmo;
 }
 
+status_t VmObjectPaged::ClonePrivate(uint64_t offset, uint64_t size, mxtl::RefPtr<VmObject>* clone_vmo) {
+    LTRACEF("vmo %p offset %#" PRIx64 " size %#" PRIx64 "\n", this, offset, size);
+
+    canary_.Assert();
+
+    AutoLock a(&lock_);
+
+    AllocChecker ac;
+    auto vmo = mxtl::AdoptRef<VmObjectPaged>(new (&ac) VmObjectPaged(pmm_alloc_flags_, mxtl::RefPtr<VmObject>(this)));
+    if (!ac.check())
+        return ERR_NO_MEMORY;
+
+    // set the new clone's size
+    auto status = vmo->ResizeLocked(size);
+    if (status != NO_ERROR)
+        return status;
+
+    // set the offset with the parent
+    // TODO: make sure that the accumulated offset of the entire parent chain doesn't wrap 64bit space
+    status = vmo->SetParentOffsetLocked(offset);
+    if (status != NO_ERROR)
+        return status;
+
+    // we're ready to go now, add it as a child to us and exit
+    AddChildLocked(vmo.get());
+
+    *clone_vmo = mxtl::move(vmo);
+
+    return NO_ERROR;
+}
+
 void VmObjectPaged::Dump(uint depth, bool verbose) {
-    if (magic_ != MAGIC) {
-        printf("VmObjectPaged at %p has bad magic\n", this);
-        return;
-    }
+    canary_.Assert();
 
     AutoLock a(&lock_);
 
@@ -102,7 +132,7 @@ void VmObjectPaged::Dump(uint depth, bool verbose) {
 }
 
 size_t VmObjectPaged::AllocatedPagesInRange(uint64_t offset, uint64_t len) const {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     AutoLock a(&lock_);
     uint64_t new_len;
     if (!TrimRange(offset, len, size_, &new_len)) {
@@ -119,7 +149,7 @@ size_t VmObjectPaged::AllocatedPagesInRange(uint64_t offset, uint64_t len) const
 }
 
 status_t VmObjectPaged::AddPage(vm_page_t* p, uint64_t offset) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("vmo %p, offset %#" PRIx64 ", page %p (%#" PRIxPTR ")\n", this, offset, p, vm_page_to_paddr(p));
 
     DEBUG_ASSERT(p);
@@ -182,7 +212,7 @@ mxtl::RefPtr<VmObject> VmObjectPaged::CreateFromROData(const void* data, size_t 
 }
 
 status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, vm_page_t** const page_out, paddr_t* const pa_out) TA_REQ(lock_) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     if (offset >= size_)
         return ERR_OUT_OF_RANGE;
@@ -245,7 +275,7 @@ status_t VmObjectPaged::GetPageLocked(uint64_t offset, uint pf_flags, vm_page_t*
 }
 
 status_t VmObjectPaged::CommitRange(uint64_t offset, uint64_t len, uint64_t* committed) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("offset %#" PRIx64 ", len %#" PRIx64 "\n", offset, len);
 
     if (committed)
@@ -323,7 +353,7 @@ status_t VmObjectPaged::CommitRange(uint64_t offset, uint64_t len, uint64_t* com
 
 status_t VmObjectPaged::CommitRangeContiguous(uint64_t offset, uint64_t len, uint64_t* committed,
                                               uint8_t alignment_log2) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("offset %#" PRIx64 ", len %#" PRIx64 ", alignment %hhu\n", offset, len, alignment_log2);
 
     if (committed)
@@ -396,7 +426,7 @@ status_t VmObjectPaged::CommitRangeContiguous(uint64_t offset, uint64_t len, uin
 }
 
 status_t VmObjectPaged::DecommitRange(uint64_t offset, uint64_t len, uint64_t* decommitted) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     LTRACEF("offset %#" PRIx64 ", len %#" PRIx64 "\n", offset, len);
 
     if (decommitted)
@@ -441,15 +471,13 @@ status_t VmObjectPaged::DecommitRange(uint64_t offset, uint64_t len, uint64_t* d
     return NO_ERROR;
 }
 
-status_t VmObjectPaged::Resize(uint64_t s) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+status_t VmObjectPaged::ResizeLocked(uint64_t s) {
+    canary_.Assert();
     LTRACEF("vmo %p, size %" PRIu64 "\n", this, s);
 
     // there's a max size to keep indexes within range
     if (s > MAX_SIZE)
         return ERR_OUT_OF_RANGE;
-
-    AutoLock a(&lock_);
 
     // see if we're shrinking the vmo
     if (s < size_) {
@@ -478,6 +506,30 @@ status_t VmObjectPaged::Resize(uint64_t s) {
     size_ = s;
 
     return NO_ERROR;
+
+}
+
+status_t VmObjectPaged::Resize(uint64_t s) {
+    AutoLock a(&lock_);
+
+    return ResizeLocked(s);
+}
+
+status_t VmObjectPaged::SetParentOffsetLocked(uint64_t offset) {
+
+    // offset must be page aligned
+    if (!IS_PAGE_ALIGNED(offset))
+        return ERR_INVALID_ARGS;
+
+    // make sure the size + this offset are still valid
+    safeint::CheckedNumeric<uint64_t> end = offset;
+    end += size_;
+    if (!end.IsValid())
+        return ERR_OUT_OF_RANGE;
+
+    parent_offset_ = offset;
+
+    return NO_ERROR;
 }
 
 // perform some sort of copy in/out on a range of the object using a passed in lambda
@@ -485,7 +537,7 @@ status_t VmObjectPaged::Resize(uint64_t s) {
 template <typename T>
 status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, size_t* bytes_copied, bool write,
                                           T copyfunc) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     if (bytes_copied)
         *bytes_copied = 0;
 
@@ -532,7 +584,7 @@ status_t VmObjectPaged::ReadWriteInternal(uint64_t offset, size_t len, size_t* b
 }
 
 status_t VmObjectPaged::Read(void* _ptr, uint64_t offset, size_t len, size_t* bytes_read) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     // test to make sure this is a kernel pointer
     if (!is_kernel_address(reinterpret_cast<vaddr_t>(_ptr))) {
         DEBUG_ASSERT_MSG(0, "non kernel pointer passed\n");
@@ -550,7 +602,7 @@ status_t VmObjectPaged::Read(void* _ptr, uint64_t offset, size_t len, size_t* by
 }
 
 status_t VmObjectPaged::Write(const void* _ptr, uint64_t offset, size_t len, size_t* bytes_written) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     // test to make sure this is a kernel pointer
     if (!is_kernel_address(reinterpret_cast<vaddr_t>(_ptr))) {
         DEBUG_ASSERT_MSG(0, "non kernel pointer passed\n");
@@ -569,7 +621,7 @@ status_t VmObjectPaged::Write(const void* _ptr, uint64_t offset, size_t len, siz
 
 status_t VmObjectPaged::Lookup(uint64_t offset, uint64_t len, uint pf_flags,
                                vmo_lookup_fn_t lookup_fn, void* context) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
     if (unlikely(len == 0))
         return ERR_INVALID_ARGS;
 
@@ -598,7 +650,7 @@ status_t VmObjectPaged::Lookup(uint64_t offset, uint64_t len, uint pf_flags,
 }
 
 status_t VmObjectPaged::ReadUser(user_ptr<void> ptr, uint64_t offset, size_t len, size_t* bytes_read) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     // test to make sure this is a user pointer
     if (!ptr.is_user_address()) {
@@ -615,7 +667,7 @@ status_t VmObjectPaged::ReadUser(user_ptr<void> ptr, uint64_t offset, size_t len
 
 status_t VmObjectPaged::WriteUser(user_ptr<const void> ptr, uint64_t offset, size_t len,
                                   size_t* bytes_written) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     // test to make sure this is a user pointer
     if (!ptr.is_user_address()) {
@@ -632,7 +684,7 @@ status_t VmObjectPaged::WriteUser(user_ptr<const void> ptr, uint64_t offset, siz
 
 status_t VmObjectPaged::LookupUser(uint64_t offset, uint64_t len, user_ptr<paddr_t> buffer,
                                    size_t buffer_size) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     uint64_t start_page_offset = ROUNDDOWN(offset, PAGE_SIZE);
     uint64_t end_page_offset = ROUNDUP(offset + len, PAGE_SIZE);
@@ -667,7 +719,7 @@ status_t VmObjectPaged::SyncCache(const uint64_t offset, const uint64_t len) {
 
 status_t VmObjectPaged::CacheOp(const uint64_t start_offset, const uint64_t len,
                                 const CacheOpType type) {
-    DEBUG_ASSERT(magic_ == MAGIC);
+    canary_.Assert();
 
     if (unlikely(len == 0))
         return ERR_INVALID_ARGS;

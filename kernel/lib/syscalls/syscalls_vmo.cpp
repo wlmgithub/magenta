@@ -158,3 +158,53 @@ mx_status_t sys_vmo_op_range(mx_handle_t handle, uint32_t op, uint64_t offset, u
 
     return vmo->RangeOp(op, offset, size, _buffer, buffer_size);
 }
+
+mx_status_t sys_vmo_clone(mx_handle_t handle, uint32_t options, uint64_t offset, uint64_t size,
+        user_ptr<mx_handle_t>(_out_handle)) {
+    LTRACEF("handle %d options %#x offset %#" PRIx64 " size %#" PRIx64 "\n",
+            handle, options, offset, size);
+
+    auto up = ProcessDispatcher::GetCurrent();
+
+    mx_status_t status;
+    mxtl::RefPtr<VmObject> clone_vmo;
+
+    {
+        // lookup the dispatcher from handle
+        mxtl::RefPtr<VmObjectDispatcher> vmo;
+        status = up->GetDispatcher(handle, &vmo);
+        if (status != NO_ERROR)
+            return status;
+
+        // clone the vmo into a new one
+        status = vmo->Clone(options, offset, size, &clone_vmo);
+        if (status != NO_ERROR)
+            return status;
+
+        DEBUG_ASSERT(clone_vmo);
+    }
+
+    // create a Vm Object dispatcher
+    mxtl::RefPtr<Dispatcher> dispatcher;
+    mx_rights_t rights;
+    mx_status_t result = VmObjectDispatcher::Create(mxtl::move(clone_vmo), &dispatcher, &rights);
+    if (result != NO_ERROR)
+        return result;
+
+    // TODO: consider what rights this clone handle should start with
+    // ie, should it get MAP if the original didn't?
+    // based on if it's a private mapping, it should get WRITE.
+    // what about EXECUTE?
+
+    // create a handle and attach the dispatcher to it
+    HandleOwner clone_handle(MakeHandle(mxtl::move(dispatcher), rights));
+    if (!clone_handle)
+        return ERR_NO_MEMORY;
+
+    if (_out_handle.copy_to_user(up->MapHandleToValue(clone_handle)) != NO_ERROR)
+        return ERR_INVALID_ARGS;
+
+    up->AddHandle(mxtl::move(clone_handle));
+
+    return NO_ERROR;
+}
